@@ -1,0 +1,69 @@
+{
+  "name": "Proposal Engine – Errors",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "96df310c-035f-472c-82bf-20162935af72",
+      "name": "Error Trigger"
+    },
+    {
+      "parameters": {
+        "sendTo": "YOUR_EMAIL@example.com",
+        "subject": "=Échec : {{ $json.workflow.name }} — {{ $json.execution.lastNodeExecuted }}",
+        "message": "=Le workflow « {{ $json.workflow.name }} » a échoué.\n\nNœud : {{ $json.execution.lastNodeExecuted }}   \nErreur : {{ $json.execution.error.message }}    \n\nVoir l'exécution : {{ $json.execution.url }}    \n\nUn prospect attend peut-être sa proposition.",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        144,
+        0
+      ],
+      "id": "5007c92d-a597-4bdc-a266-60c3afff8d27",
+      "name": "Alert me"
+    },
+    {
+      "parameters": {
+        "content": "## Error",
+        "height": 192,
+        "width": 384,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -48,
+        -48
+      ],
+      "id": "bdbddf42-f2c7-46f5-8303-7dbc440a7735",
+      "name": "Sticky Note"
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Alert me",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "nodeGroups": [],
+  "pinData": {}
+}

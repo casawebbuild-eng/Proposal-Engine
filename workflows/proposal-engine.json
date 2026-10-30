@@ -1,0 +1,869 @@
+{
+  "name": "Proposal Engine - Workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "// Normalize (webhook version) — Proposal Engine\n// Receives the JSON sent by the /projet page (through your Next.js API route),\n// checks every field against the allowed values, and outputs the SAME clean object\n// the old form version produced. Every node after this one stays unchanged.\n//\n// It never throws on bad data. It outputs { valid, errors, ...data } and the next\n// IF node decides: valid -> continue, invalid -> Stop and Error (-> your error alert).\n// The page's server already validates with the same rules; this is the second lock,\n// in case anything ever reaches the webhook without going through your page.\n//\n// Keep the node NAMED \"Normalize\": later nodes read $('Normalize') by name.\n// Mode: Run Once for All Items · Language: JavaScript\n\n// ---------------------------------------------------------------------------\n// ALLOWED VALUES — must match the page's options exactly.\n// ---------------------------------------------------------------------------\nconst SECTORS = ['Restaurant', 'Immobilier', 'E-commerce', 'Autre'];\n\nconst NEEDS = {\n  Restaurant: ['Commande en ligne', 'Réservation de tables', 'Menu multilingue', 'Intégration Instagram'],\n  Immobilier: ['Recherche et filtres', 'Capture et qualification de leads', 'Visites virtuelles / 3D', 'Intégration CRM'],\n  'E-commerce': ['Paiements', 'Multi-devises', 'Synchro des stocks', 'Relance panier abandonné'],\n  Autre: [],\n};\n\nconst PRODUCT_RANGES = ['Moins de 50', '50 – 500', 'Plus de 500'];\nconst PLATFORMS = ['Shopify', 'WooCommerce', \"Aucune pour l'instant\", 'Autre'];\nconst LANGUAGES = ['Français', 'Arabe', 'Anglais'];\nconst BUDGETS = [\n  'Moins de 1 000 DH/mois',\n  '1 000 – 2 000 DH/mois',\n  '2 000 – 4 000 DH/mois',\n  'Plus de 4 000 DH/mois',\n];\n\n// Max lengths: protects the AI step and the PDF from absurdly long input.\nconst MAX = { short: 120, goal: 1000, notes: 1000, description: 2000 };\n\n// ---------------------------------------------------------------------------\n// Helpers\n// ---------------------------------------------------------------------------\nconst errors = [];\n\nfunction text(value, field, { required = false, max = MAX.short } = {}) {\n  const s = typeof value === 'string' ? value.trim() : '';\n  if (!s) {\n    if (required) errors.push(`${field} : obligatoire`);\n    return null;\n  }\n  if (s.length > max) errors.push(`${field} : trop long (max ${max})`);\n  return s.slice(0, max);\n}\n\nfunction oneOf(value, field, allowed, { required = true } = {}) {\n  if (value === undefined || value === null || value === '') {\n    if (required) errors.push(`${field} : obligatoire`);\n    return null;\n  }\n  if (!allowed.includes(value)) {\n    errors.push(`${field} : valeur non autorisée`);\n    return null;\n  }\n  return value;\n}\n\nfunction listOf(value, field, allowed) {\n  if (value === undefined || value === null) return [];\n  if (!Array.isArray(value)) {\n    errors.push(`${field} : doit être une liste`);\n    return [];\n  }\n  const clean = [...new Set(value)].filter((v) => allowed.includes(v));\n  if (clean.length !== value.length) errors.push(`${field} : valeur(s) non autorisée(s)`);\n  return clean;\n}\n\nfunction wholeNumber(value, field, { min = 0, max = 100000 } = {}) {\n  const n = Number(value);\n  if (!Number.isInteger(n) || n < min || n > max) {\n    errors.push(`${field} : nombre invalide`);\n    return null;\n  }\n  return n;\n}\n\n// ---------------------------------------------------------------------------\n// Validate\n// ---------------------------------------------------------------------------\n// The Webhook node puts the JSON payload under \"body\".\nconst b = $input.first().json.body || {};\nconst contact = b.contact || {};\nconst scope = b.scope || {};\nconst d = b.details || {};\n\nconst email = text(contact.email, 'email', { required: true });\nif (email && !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email)) errors.push('email : format invalide');\n\nconst sector = oneOf(b.sector, 'secteur', SECTORS);\n\nlet details = {};\nif (sector === 'Restaurant') {\n  details = {\n    locations: wholeNumber(d.locations, 'établissements', { min: 1, max: 500 }),\n    currentSite: text(d.currentSite, 'site actuel', { max: 200 }),\n  };\n} else if (sector === 'Immobilier') {\n  details = {\n    listings: wholeNumber(d.listings, 'biens', { min: 0, max: 100000 }),\n    markets: text(d.markets, 'villes', { required: true }),\n  };\n} else if (sector === 'E-commerce') {\n  details = {\n    productRange: oneOf(d.productRange, 'nombre de produits', PRODUCT_RANGES),\n    platform: oneOf(d.platform, 'plateforme', PLATFORMS),\n  };\n} else if (sector === 'Autre') {\n  details = { description: text(d.description, 'description', { required: true, max: MAX.description }) };\n}\n\n// Deadline: a real calendar date in YYYY-MM-DD form (past or absurd dates are\n// still accepted here: Price flags them for your review instead of rejecting the lead).\nlet deadline = null;\nif (scope.deadline) {\n  if (/^\\d{4}-\\d{2}-\\d{2}$/.test(scope.deadline) && !Number.isNaN(Date.parse(scope.deadline))) {\n    deadline = scope.deadline;\n  } else {\n    errors.push('date de lancement : format invalide');\n  }\n}\n\nconst data = {\n  // Set here, not by the browser: the server's clock is the one you can trust.\n  submittedAt: new Date().toISOString(),\n  isTest: b.isTest === true,\n  contact: {\n    name: text(contact.name, 'nom', { required: true }),\n    email: email ? email.toLowerCase() : null,\n    company: text(contact.company, 'entreprise', { required: true }),\n  },\n  sector,\n  goal: text(b.goal, 'objectif', { required: true, max: MAX.goal }),\n  needs: sector ? listOf(b.needs, 'besoins', NEEDS[sector]) : [],\n  details,\n  scope: {\n    languages: listOf(scope.languages, 'langues', LANGUAGES),\n    budgetRaw: oneOf(scope.budgetRaw, 'budget', BUDGETS),\n    budgetNumber: null, // kept for compatibility: Price parses the range itself\n    deadline,\n    notes: text(scope.notes, 'remarques', { max: MAX.notes }),\n  },\n};\n\nreturn [{ json: { valid: errors.length === 0, errors, ...data } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        512,
+        0
+      ],
+      "id": "50ff1847-dd56-4375-95d4-1b38ea8a5d4d",
+      "name": "Normalize"
+    },
+    {
+      "parameters": {
+        "model": "beam:cloud",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        1056,
+        -48
+      ],
+      "id": "dd78dc2e-006d-49d1-ab63-5328041e8d2f",
+      "name": "Ollama Chat Model"
+    },
+    {
+      "parameters": {
+        "text": "=Date du jour : {{ $now.toFormat('yyyy-MM-dd') }}\nSecteur : {{ $json.sector }}\nObjectif : {{ $json.goal }}\nBesoins cochés : {{ $json.needs.join(', ') || 'aucun' }}\nDétails secteur : {{ JSON.stringify($json.details) }}\nLangues : {{ $json.scope.languages.join(', ') || 'non précisé' }}\nDate de lancement souhaitée : {{ $json.scope.deadline ?? 'non précisée' }}\nRemarques : {{ $json.scope.notes ?? 'aucune' }}",
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"summary\": {\n      \"type\": \"string\",\n      \"description\": \"One sentence in French summarising what the prospect wants, using only what they wrote.\"\n    },\n    \"projectType\": {\n      \"type\": \"string\",\n      \"enum\": [\n        \"site_vitrine\",\n        \"site_reservation\",\n        \"e_commerce\",\n        \"plateforme_immobiliere\",\n        \"application_sur_mesure\",\n        \"autre\"\n      ],\n      \"description\": \"The closest project type. Use 'autre' if none fits.\"\n    },\n    \"features\": {\n      \"type\": \"array\",\n      \"items\": { \"type\": \"string\" },\n      \"description\": \"Concrete features explicitly requested (checked needs plus anything named in the free text). Short French phrases.\"\n    },\n    \"wantsMotion3D\": {\n      \"type\": \"boolean\",\n      \"description\": \"True only if the prospect explicitly wants the website itself to have animation, motion, 3D or an immersive/premium visual experience. A 3D virtual tour of a property or product is a feature, not site design: list it in features and do NOT set this to true for it alone.\"\n    },\n    \"integrations\": {\n      \"type\": \"array\",\n      \"items\": { \"type\": \"string\" },\n      \"description\": \"Third-party tools or platforms to connect (e.g. Instagram, CRM, Shopify). Empty if none mentioned.\"\n    },\n    \"clarity\": {\n      \"type\": \"string\",\n      \"enum\": [\"claire\", \"partielle\", \"vague\"],\n      \"description\": \"How clearly the prospect described their need. 'vague' if the goal is empty, meaningless or a few random characters.\"\n    },\n    \"redFlags\": {\n      \"type\": \"array\",\n      \"items\": { \"type\": \"string\" },\n      \"description\": \"Problems worth checking before quoting: deadline in the past, impossible or unrealistically close; numbers that look impossible; contradictory or meaningless answers. Do NOT judge whether the budget is enough: pricing is handled elsewhere. Short French phrases. Empty if none.\"\n    },\n    \"questionsToAsk\": {\n      \"type\": \"array\",\n      \"items\": { \"type\": \"string\" },\n      \"description\": \"Up to 3 short French questions to clarify the project before sending a final proposal. Empty if the request is clear.\"\n    }\n  },\n  \"required\": [\n    \"summary\",\n    \"projectType\",\n    \"features\",\n    \"wantsMotion3D\",\n    \"integrations\",\n    \"clarity\",\n    \"redFlags\",\n    \"questionsToAsk\"\n  ]\n}",
+        "options": {
+          "systemPromptTemplate": "   Tu extrais des informations d'une demande de projet web. N'invente rien : utilise uniquement ce que le prospect a écrit ou coché. Ne donne jamais de prix ni d'estimation. Si une information manque, laisse le tableau vide ou choisis la valeur la plus prudente."
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.informationExtractor",
+      "typeVersion": 1.2,
+      "position": [
+        912,
+        -192
+      ],
+      "id": "eacdde53-1c9c-47cf-8276-0657e9bfa70d",
+      "name": "Extract requirements",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "operation": "addToDate",
+        "magnitude": "={{ $('Normalize').item.json.submittedAt }}",
+        "duration": 15,
+        "outputFieldName": "validUntil",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.dateTime",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        -192
+      ],
+      "id": "af580b62-eb61-48bc-bfd6-1c3825ccc019",
+      "name": "Validity date"
+    },
+    {
+      "parameters": {
+        "operation": "formatDate",
+        "date": "={{ $('Validity date').item.json.validUntil }}",
+        "format": "custom",
+        "customFormat": "dd/MM/yyyy",
+        "outputFieldName": "validUntilLabel",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.dateTime",
+      "typeVersion": 2,
+      "position": [
+        1376,
+        -192
+      ],
+      "id": "fcf29260-0eee-41db-b532-e0c2c0a6accc",
+      "name": "Format validity"
+    },
+    {
+      "parameters": {
+        "value": "={{ $('Normalize').item.json.contact.email }}|{{ $('Normalize').item.json.submittedAt }}",
+        "dataPropertyName": "proposalHash"
+      },
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 2,
+      "position": [
+        1552,
+        -192
+      ],
+      "id": "b702e624-4931-4e62-8009-c1eee820f1b8",
+      "name": "Proposal hash"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "1762408b-1513-4b36-8714-93a6b0baf5a7",
+              "name": "proposalId",
+              "value": "=CWB-{{ $now.toFormat('yyMM') }}-{{ $('Proposal hash').item.json.proposalHash.slice(0, 6).toUpperCase() }}",
+              "type": "string"
+            },
+            {
+              "id": "66a84b13-734a-47ae-9094-2e0ff7161417",
+              "name": "validUntil",
+              "value": "={{ $('Validity date').item.json.validUntil }}",
+              "type": "string"
+            },
+            {
+              "id": "1a36936f-75c7-4416-8a26-025147236a87",
+              "name": "validUntilLabel",
+              "value": "={{ $('Format validity').item.json.validUntilLabel }}",
+              "type": "string"
+            },
+            {
+              "id": "17345a58-b87f-4513-943a-d4f4f40d6c83",
+              "name": "lead",
+              "value": "={{ $('Normalize').item.json }}",
+              "type": "object"
+            },
+            {
+              "id": "50462a67-2f46-4448-bde7-b2f3c9098e79",
+              "name": "requirements",
+              "value": "={{ $('Extract requirements').item.json.output }}",
+              "type": "object"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        1728,
+        -192
+      ],
+      "id": "968bddb3-a284-4146-a0e7-b6db9aebb7d9",
+      "name": "Assemble proposal"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Price — Proposal Engine, stage 3\n// Applies YOUR pricing grid to the assembled proposal, then turns the project\n// value into a rental offer: a setup fee + a monthly fee, no commitment.\n// The AI never sets a price: every number comes from PRICING below,\n// so every quote can be explained line by line.\n// Mode: Run Once for All Items · Language: JavaScript\n\n// ---------------------------------------------------------------------------\n// CONFIG — your pricing grid. Change numbers here, nowhere else.\n// ---------------------------------------------------------------------------\nconst PRICING = {\n  // Base price per project type (DH). null = \"devis manuel\": no automatic price.\n  base: {\n    site_vitrine: 12000,\n    site_reservation: 18000,\n    e_commerce: 25000,\n    plateforme_immobiliere: 25000,\n    application_sur_mesure: null,\n    autre: null,\n  },\n  extraLanguage: 2500, // each language beyond the first\n  feature: 2500,       // each requested feature not already included in the base\n  integration: 2000,   // each third-party integration\n  motionPercent: 30,   // added when the prospect wants motion/3D design\n  rush: { underWeeks: 4, percent: 25 },\n  floor: 8000,         // no project value goes below this\n\n  // Rental model. The project value above is what the build is worth;\n  // the client pays it as a setup fee + a monthly fee instead of all at once.\n  rental: {\n    setupPercent: 40,      // % of project value paid upfront (protects you: no commitment)\n    amortizationMonths: 24, // the rest of the project value is spread over this many months\n    maintenance: 300,      // added every month: maintenance, security, small content updates\n    roundMonthlyTo: 50,\n    includes: ['Maintenance et sécurité', 'Petites mises à jour de contenu'],\n    excludes: ['Hébergement et nom de domaine (à la charge du client)'],\n  },\n\n  // Features already covered by a base price (matched by keyword, lowercase).\n  // e.g. a booking site already includes booking, so it is not charged twice.\n  includedFeatures: {\n    site_reservation: ['réservation'],\n    e_commerce: ['paiement', 'panier', 'commande'],\n    plateforme_immobiliere: ['recherche', 'filtre'],\n  },\n};\n\n// French labels for the proposal lines.\nconst TYPE_LABELS = {\n  site_vitrine: 'Site vitrine sur mesure',\n  site_reservation: 'Site avec réservation en ligne',\n  e_commerce: 'Boutique en ligne',\n  plateforme_immobiliere: 'Plateforme immobilière',\n  application_sur_mesure: 'Application sur mesure',\n  autre: 'Projet sur mesure',\n};\n\n// ---------------------------------------------------------------------------\n// Helpers\n// ---------------------------------------------------------------------------\n\n// Percentage lines are rounded to the nearest 100 DH so the total stays clean.\nconst round100 = (n) => Math.round(n / 100) * 100;\n\n// Removes duplicates case-insensitively, keeping the first spelling seen.\nfunction dedupe(items) {\n  const seen = new Set();\n  return items.filter((item) => {\n    const key = item.toLowerCase().trim();\n    if (!key || seen.has(key)) return false;\n    seen.add(key);\n    return true;\n  });\n}\n\n// Reads a budget option like \"10 000 – 20 000 DH\", \"Moins de 10 000 DH\"\n// or \"Plus de 40 000 DH\" into { min, max }. max = null means no upper limit.\n// Parses the numbers instead of matching exact strings, so a dash or space\n// typed differently in the dropdown doesn't break it.\nfunction parseBudget(raw) {\n  if (!raw) return null;\n  const numbers = (raw.match(/\\d{1,3}(?:[\\s\\u00a0\\u202f.]\\d{3})+|\\d+/g) || [])\n    .map((n) => Number(n.replace(/\\D/g, '')));\n  const lower = raw.toLowerCase().trim();\n  if (lower.startsWith('moins') && numbers.length) return { min: 0, max: numbers[0] };\n  if (lower.startsWith('plus') && numbers.length) return { min: numbers[0], max: null };\n  if (numbers.length >= 2) return { min: numbers[0], max: numbers[1] };\n  return null;\n}\n\n// Number formatted the French way: 12500 -> \"12 500 DH\".\n// toLocaleString('fr-FR') separates thousands with a NARROW no-break space (U+202F),\n// which many fonts (Instrument Serif included) don't contain, so \"12 800\" printed as\n// \"12800\". Swap it for a regular no-break space (U+00A0), which every font has and which\n// still keeps the number on one line.\nconst frNumber = (n) => n.toLocaleString('fr-FR').replace(/\\u202f/g, '\\u00a0');\nconst dh = (n) => `${frNumber(n)}\\u00a0DH`;\n\n// ---------------------------------------------------------------------------\n// Inputs (from \"Assemble proposal\")\n// ---------------------------------------------------------------------------\nconst input = $input.first().json;\nconst lead = input.lead;\nconst req = input.requirements;\n\nconst lines = [];\nconst warnings = [];\nconst projectType = req.projectType;\nconst base = PRICING.base[projectType];\nconst manualQuote = base === null || base === undefined;\n\n// ---------------------------------------------------------------------------\n// Deadline (computed for every proposal, used for the rush fee)\n// ---------------------------------------------------------------------------\nconst deadlineMs = Date.parse(lead.scope.deadline);\nconst submittedMs = Date.parse(lead.submittedAt);\nlet weeksToDeadline = null;\nif (Number.isNaN(deadlineMs) || Number.isNaN(submittedMs)) {\n  warnings.push('Date de lancement absente ou invalide : pas de majoration urgence appliquée.');\n} else {\n  weeksToDeadline = (deadlineMs - submittedMs) / (7 * 24 * 60 * 60 * 1000);\n  if (weeksToDeadline < 0) {\n    warnings.push('Date de lancement dans le passé : à clarifier avec le prospect.');\n    weeksToDeadline = null;\n  } else if (weeksToDeadline > 104) {\n    // More than 2 years away is almost certainly a typo (e.g. year 20222).\n    warnings.push('Date de lancement incohérente (plus de 2 ans) : à clarifier avec le prospect.');\n    weeksToDeadline = null;\n  }\n}\n\nlet total = null;\nlet rushApplied = false;\nlet floorApplied = false;\n\nif (manualQuote) {\n  warnings.push(`Type de projet \"${projectType}\" : devis manuel requis, aucun prix automatique.`);\n} else {\n  // 1. Base\n  lines.push({ label: TYPE_LABELS[projectType], amount: base, included: false });\n\n  // 2. Languages: French counts as the primary language when present.\n  const languages = dedupe(lead.scope.languages || []);\n  const ordered = languages.includes('Français')\n    ? ['Français', ...languages.filter((l) => l !== 'Français')]\n    : languages;\n  for (const language of ordered.slice(1)) {\n    lines.push({ label: `Langue supplémentaire : ${language}`, amount: PRICING.extraLanguage, included: false });\n  }\n\n  // 3. Features and integrations.\n  // A feature like \"Intégration Instagram\" is counted once, as an integration.\n  const allFeatures = dedupe(req.features || []);\n  const integrationFeatures = allFeatures.filter((f) => /intégration/i.test(f));\n  const features = allFeatures.filter((f) => !/intégration/i.test(f));\n  const integrations = dedupe([\n    ...(req.integrations || []),\n    ...integrationFeatures.map((f) => f.replace(/^intégration\\s*/i, '')),\n  ]);\n\n  const includedKeywords = PRICING.includedFeatures[projectType] || [];\n  for (const feature of features) {\n    const included = includedKeywords.some((k) => feature.toLowerCase().includes(k));\n    lines.push({\n      label: `Fonctionnalité : ${feature}`,\n      amount: included ? 0 : PRICING.feature,\n      included,\n    });\n  }\n  for (const integration of integrations) {\n    lines.push({ label: `Intégration : ${integration}`, amount: PRICING.integration, included: false });\n  }\n\n  const subtotal = lines.reduce((sum, line) => sum + line.amount, 0);\n\n  // 4. Motion / 3D design premium, on the subtotal.\n  let motion = 0;\n  if (req.wantsMotion3D) {\n    motion = round100(subtotal * PRICING.motionPercent / 100);\n    lines.push({ label: `Design animé / 3D (+${PRICING.motionPercent} %)`, amount: motion, included: false });\n  }\n\n  // 5. Rush fee, on everything above.\n  if (weeksToDeadline !== null && weeksToDeadline < PRICING.rush.underWeeks) {\n    const rush = round100((subtotal + motion) * PRICING.rush.percent / 100);\n    lines.push({ label: `Délai court, moins de ${PRICING.rush.underWeeks} semaines (+${PRICING.rush.percent} %)`, amount: rush, included: false });\n    rushApplied = true;\n  }\n\n  total = lines.reduce((sum, line) => sum + line.amount, 0);\n\n  // 6. Floor\n  if (total < PRICING.floor) {\n    lines.push({ label: 'Ajustement au montant minimum', amount: PRICING.floor - total, included: false });\n    total = PRICING.floor;\n    floorApplied = true;\n  }\n}\n\n// ---------------------------------------------------------------------------\n// Budget check: price vs the range the prospect selected\n// ---------------------------------------------------------------------------\n// ---------------------------------------------------------------------------\n// Rental offer: setup fee + monthly fee\n// ---------------------------------------------------------------------------\nlet rental = null;\nif (total !== null) {\n  const R = PRICING.rental;\n  const setupFee = round100(total * R.setupPercent / 100);\n  const rawMonthly = (total - setupFee) / R.amortizationMonths + R.maintenance;\n  const monthly = Math.ceil(rawMonthly / R.roundMonthlyTo) * R.roundMonthlyTo;\n  rental = {\n    setupFee,\n    setupFeeLabel: dh(setupFee),\n    monthly,\n    monthlyLabel: `${dh(monthly)} / mois`,\n    commitment: 'Sans engagement',\n    includes: R.includes,\n    excludes: R.excludes,\n    // Internal: month at which you've recovered the full project value.\n    breakEvenMonth: Math.ceil((total - setupFee) / (monthly - R.maintenance)),\n  };\n}\n\n// ---------------------------------------------------------------------------\n// Budget check: the monthly fee vs the monthly range the prospect selected\n// ---------------------------------------------------------------------------\nconst budget = parseBudget(lead.scope.budgetRaw);\nlet budgetStatus = 'inconnu';\nif (budget && rental) {\n  if (budget.max !== null && rental.monthly > budget.max) budgetStatus = 'au_dessus';\n  else if (rental.monthly < budget.min) budgetStatus = 'en_dessous';\n  else budgetStatus = 'dans_budget';\n}\nif (budgetStatus === 'au_dessus') {\n  warnings.push(`Mensualité (${rental.monthlyLabel}) au-dessus du budget indiqué (${lead.scope.budgetRaw}).`);\n}\n\n// ---------------------------------------------------------------------------\n// Review gate: anything uncertain goes to you before it goes to the prospect\n// ---------------------------------------------------------------------------\nconst needsReview =\n  manualQuote ||\n  req.clarity !== 'claire' ||\n  (req.redFlags || []).length > 0 ||\n  budgetStatus === 'au_dessus' ||\n  warnings.length > 0;\n\nreturn [\n  {\n    json: {\n      ...input,\n      pricing: {\n        manualQuote,\n        currency: 'DH',\n        lines: lines.map((line) => ({ ...line, amountLabel: line.included ? 'Inclus' : dh(line.amount) })),\n        // Project value: what the build is worth. Internal reference;\n        // the client-facing offer is the rental below.\n        total,\n        totalLabel: total === null ? 'Sur devis' : dh(total),\n        rental,\n        rushApplied,\n        floorApplied,\n        weeksToDeadline: weeksToDeadline === null ? null : Math.round(weeksToDeadline * 10) / 10,\n        budget: {\n          raw: lead.scope.budgetRaw,\n          min: budget ? budget.min : null,\n          max: budget ? budget.max : null,\n          status: budgetStatus,\n        },\n        warnings,\n        needsReview,\n      },\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1904,
+        -192
+      ],
+      "id": "3d5d1b27-2700-4c02-9778-62394562cf6d",
+      "name": "Price"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare document — Proposal Engine, stage 4\n// Turns the priced proposal into ready-to-print French text for the PDF template.\n// Two jobs:\n//   1. Wording: internal labels become client-facing ones (\"Fonctionnalité : X\" -> \"X\").\n//   2. Safety: everything the prospect typed is HTML-escaped. The PDF is rendered by a\n//      real browser (Gotenberg/Chromium); unescaped input like <img src=\"http://...\"> would\n//      make that browser load whatever URL a stranger typed into your form.\n// Mode: Run Once for All Items · Language: JavaScript\n\n// ---------------------------------------------------------------------------\n// CONFIG — your studio details, printed in the PDF footer. Fill these in.\n// ---------------------------------------------------------------------------\nconst STUDIO = {\n  name: 'CasaWebBuild',\n  email: 'VOTRE_EMAIL',        // e.g. contact@yourdomain.com\n  phone: 'VOTRE_TELEPHONE',    // e.g. +212 6 XX XX XX XX\n  city: 'Casablanca',\n};\n\n// Title shown under \"Votre projet\", per project type.\nconst PROJECT_TITLES = {\n  site_vitrine: 'Site vitrine sur mesure',\n  site_reservation: 'Site avec réservation en ligne',\n  e_commerce: 'Boutique en ligne sur mesure',\n  plateforme_immobiliere: 'Plateforme immobilière sur mesure',\n  application_sur_mesure: 'Application web sur mesure',\n  autre: 'Projet web sur mesure',\n};\n\n// ---------------------------------------------------------------------------\n// Helpers\n// ---------------------------------------------------------------------------\n\n// Makes any text safe to put inside HTML.\nfunction esc(value) {\n  return String(value ?? '')\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;')\n    .replace(/\"/g, '&quot;')\n    .replace(/'/g, '&#39;');\n}\n\n// Capitalises the first letter (names typed in lowercase look careless on a proposal).\nconst capitalize = (s) => s.replace(/(^|\\s|-)(\\p{L})/gu, (m, sep, ch) => sep + ch.toUpperCase());\n\n// The base price line is shown as the core work, not as the project type again\n// (the project type is already the title of section 01).\nconst BASE_SCOPE_LABEL = 'Design et développement sur mesure';\n\n// Pricing line label -> client-facing scope item. null = not shown to the client.\nfunction scopeLabel(label, index) {\n  if (index === 0) return BASE_SCOPE_LABEL;          // first line is always the base price\n  if (label.startsWith('Ajustement')) return null;   // internal floor adjustment\n  if (label.startsWith('Fonctionnalité : ')) return label.replace('Fonctionnalité : ', '');\n  if (label.startsWith('Intégration : ')) return label.replace('Intégration : ', 'Intégration ');\n  if (label.startsWith('Langue supplémentaire : ')) return `Version ${label.replace('Langue supplémentaire : ', '').toLowerCase()}`;\n  if (label.startsWith('Design animé')) return 'Design animé et 3D sur mesure';\n  if (label.startsWith('Délai court')) return 'Livraison accélérée';\n  return label;\n}\n\n// ---------------------------------------------------------------------------\n// Build the document fields\n// ---------------------------------------------------------------------------\nconst input = $input.first().json;\nconst { lead, requirements: req, pricing } = input;\n\nconst issued = new Date(lead.submittedAt);\nconst dateLabel = [\n  String(issued.getDate()).padStart(2, '0'),\n  String(issued.getMonth() + 1).padStart(2, '0'),\n  issued.getFullYear(),\n].join('.');\n\nconst scopeItems = pricing.lines\n  .map((line, index) => scopeLabel(line.label, index))\n  .filter(Boolean);\n\nconst scopeHtml = scopeItems\n  .map((item, i) => `<li><span class=\"num\">${String(i + 1).padStart(2, '0')}</span><span>${esc(item)}</span></li>`)\n  .join('');\n\nconst rental = pricing.rental;\nconst listHtml = (items) => items.map((item) => `<li>${esc(item)}</li>`).join('');\n\nreturn [\n  {\n    json: {\n      ...input,\n      doc: {\n        proposalId: esc(input.proposalId),\n        dateLabel,\n        validUntilLabel: esc(input.validUntilLabel),\n        company: esc(capitalize(lead.contact.company || 'Votre entreprise')),\n        name: esc(capitalize(lead.contact.name || '')),\n        goal: esc(lead.goal || ''),\n        projectTitle: esc(PROJECT_TITLES[req.projectType] || PROJECT_TITLES.autre),\n        scopeHtml,\n        manualQuote: pricing.manualQuote,\n        // Monthly fee split in two so the template can set the number large.\n        // Regular no-break space instead of the narrow one (see the note in Price).\n        monthlyAmount: rental ? rental.monthly.toLocaleString('fr-FR').replace(/\\u202f/g, '\\u00a0') : 'Sur devis',\n        monthlyUnit: rental ? 'DH / mois' : '',\n        setupFeeLabel: rental ? esc(rental.setupFeeLabel) : '—',\n        commitment: rental ? esc(rental.commitment) : '',\n        includesHtml: rental ? listHtml(rental.includes) : '',\n        excludesHtml: rental ? listHtml(rental.excludes) : '',\n        studioName: esc(STUDIO.name),\n        studioEmail: esc(STUDIO.email),\n        studioPhone: esc(STUDIO.phone),\n        studioCity: esc(STUDIO.city),\n      },\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2080,
+        -192
+      ],
+      "id": "c6564bd9-41e1-4945-91b6-90c0b358d368",
+      "name": "Prepare Document"
+    },
+    {
+      "parameters": {
+        "html": "<!DOCTYPE html>\n<html lang=\"fr\">\n<head>\n<meta charset=\"utf-8\">\n<title>Proposition {{ $json.doc.proposalId }}</title>\n<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">\n<link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>\n<link href=\"https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@300;400;500&family=Geist+Mono:wght@400&display=block\" rel=\"stylesheet\">\n<style>\n  /* Minimal, one accent. The character comes from type scale and spacing, not decoration. */\n  :root {\n    --ink: #121212;\n    --muted: #77777a;\n    --hair: #e3e2de;\n    --paper: #fbfaf7;\n    --accent: #b8432b;\n    --serif: 'Instrument Serif', 'Times New Roman', serif;\n    --sans: 'Geist', 'Helvetica Neue', Arial, sans-serif;\n    --mono: 'Geist Mono', 'Courier New', monospace;\n  }\n  @page { size: A4; margin: 0; }\n  * { box-sizing: border-box; margin: 0; padding: 0; }\n  html, body { background: var(--paper); }\n  body {\n    width: 210mm;\n    height: 297mm;\n    padding: 16mm 18mm 14mm;\n    color: var(--ink);\n    font-family: var(--sans);\n    font-weight: 300;\n    font-size: 9.5pt;\n    line-height: 1.5;\n    display: flex;\n    flex-direction: column;\n    -webkit-print-color-adjust: exact;\n    print-color-adjust: exact;\n  }\n\n  /* Meta row */\n  .meta {\n    display: flex;\n    justify-content: space-between;\n    align-items: baseline;\n    font-family: var(--mono);\n    font-size: 7.5pt;\n    letter-spacing: 0.08em;\n    text-transform: uppercase;\n    color: var(--muted);\n    padding-bottom: 4mm;\n    border-bottom: 0.5pt solid var(--ink);\n  }\n  .brand { color: var(--ink); letter-spacing: 0.14em; }\n  .brand i { color: var(--accent); font-style: normal; }\n\n  /* Title */\n  .hero { padding: 16mm 0 12mm; }\n  .eyebrow { font-size: 9pt; color: var(--muted); margin-bottom: 3mm; }\n  .company {\n    font-family: var(--serif);\n    font-weight: 400;\n    font-size: 54pt;\n    line-height: 0.95;\n    letter-spacing: -0.02em;\n  }\n  .for { margin-top: 5mm; font-size: 9.5pt; }\n  .for b { font-weight: 500; }\n\n  /* Numbered sections: label column + content column */\n  .section {\n    display: grid;\n    grid-template-columns: 38mm 1fr;\n    padding: 6mm 0;\n    border-top: 0.5pt solid var(--hair);\n  }\n  .label {\n    font-family: var(--mono);\n    font-size: 7.5pt;\n    letter-spacing: 0.08em;\n    text-transform: uppercase;\n    color: var(--muted);\n    padding-top: 1mm;\n  }\n  .label b { color: var(--accent); font-weight: 400; margin-right: 2mm; }\n  .project-title { font-family: var(--serif); font-size: 17pt; line-height: 1.15; margin-bottom: 2mm; }\n  .goal { color: var(--muted); font-style: italic; max-width: 120mm; }\n\n  /* Scope list: two columns, hairline rows */\n  .scope { list-style: none; columns: 2; column-gap: 8mm; }\n  .scope li {\n    display: flex;\n    gap: 3mm;\n    break-inside: avoid;\n    padding: 1.6mm 0;\n    border-bottom: 0.5pt solid var(--hair);\n  }\n  .scope .num { font-family: var(--mono); font-size: 7pt; color: var(--muted); padding-top: 0.6mm; min-width: 5mm; }\n\n  /* Offer */\n  .offer { display: grid; grid-template-columns: 1fr 52mm; gap: 8mm; align-items: end; }\n  .price { display: flex; align-items: baseline; gap: 3mm; }\n  .price .amount {\n    font-family: var(--serif);\n    font-size: 64pt;\n    line-height: 0.9;\n    letter-spacing: -0.03em;\n    font-variant-numeric: lining-nums;\n  }\n  .price .unit { font-size: 10pt; color: var(--accent); }\n  .commitment { margin-top: 2mm; font-size: 9pt; }\n  .facts { list-style: none; font-size: 8.5pt; }\n  .facts li { display: flex; justify-content: space-between; padding: 1.4mm 0; border-bottom: 0.5pt solid var(--hair); }\n  .facts li span:first-child { color: var(--muted); }\n  .included { display: grid; grid-template-columns: 1fr 1fr; gap: 8mm; margin-top: 5mm; font-size: 8.5pt; }\n  .included h4 { font-family: var(--mono); font-weight: 400; font-size: 7pt; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 1.5mm; }\n  .included ul { list-style: none; }\n  .included li::before { content: '— '; color: var(--muted); }\n\n  .terms p { font-size: 8.5pt; color: #3c3c3e; max-width: 135mm; margin-bottom: 1.5mm; }\n\n  /* Footer pinned to the bottom of the page */\n  .footer {\n    margin-top: auto;\n    display: flex;\n    justify-content: space-between;\n    padding-top: 4mm;\n    border-top: 0.5pt solid var(--ink);\n    font-family: var(--mono);\n    font-size: 7pt;\n    letter-spacing: 0.06em;\n    text-transform: uppercase;\n    color: var(--muted);\n  }\n</style>\n</head>\n<body>\n\n  <div class=\"meta\">\n    <span class=\"brand\">{{ $json.doc.studioName }}<i>.</i></span>\n    <span>Proposition {{ $json.doc.proposalId }}</span>\n    <span>{{ $json.doc.dateLabel }}</span>\n  </div>\n\n  <div class=\"hero\">\n    <p class=\"eyebrow\">Proposition de projet web</p>\n    <h1 class=\"company\">{{ $json.doc.company }}</h1>\n    <p class=\"for\">Préparée pour <b>{{ $json.doc.name }}</b></p>\n  </div>\n\n  <div class=\"section\">\n    <div class=\"label\"><b>01</b>Le projet</div>\n    <div>\n      <p class=\"project-title\">{{ $json.doc.projectTitle }}</p>\n      <p class=\"goal\">«&nbsp;{{ $json.doc.goal }}&nbsp;»</p>\n    </div>\n  </div>\n\n  <div class=\"section\">\n    <div class=\"label\"><b>02</b>Ce qui est inclus</div>\n    <ul class=\"scope\">{{ $json.doc.scopeHtml }}</ul>\n  </div>\n\n  <div class=\"section\">\n    <div class=\"label\"><b>03</b>L'offre</div>\n    <div>\n      <div class=\"offer\">\n        <div>\n          <div class=\"price\">\n            <span class=\"amount\">{{ $json.doc.monthlyAmount }}</span>\n            <span class=\"unit\">{{ $json.doc.monthlyUnit }}</span>\n          </div>\n          <p class=\"commitment\">{{ $json.doc.commitment }}</p>\n        </div>\n        <ul class=\"facts\">\n          <li><span>Mise en place</span><span>{{ $json.doc.setupFeeLabel }}</span></li>\n          <li><span>Engagement</span><span>Aucun</span></li>\n          <li><span>Valable jusqu'au</span><span>{{ $json.doc.validUntilLabel }}</span></li>\n        </ul>\n      </div>\n      <div class=\"included\">\n        <div><h4>Compris chaque mois</h4><ul>{{ $json.doc.includesHtml }}</ul></div>\n        <div><h4>Non compris</h4><ul>{{ $json.doc.excludesHtml }}</ul></div>\n      </div>\n    </div>\n  </div>\n\n  <div class=\"section terms\">\n    <div class=\"label\"><b>04</b>Conditions</div>\n    <div>\n      <p>Les frais de mise en place sont réglés au démarrage du projet. L'abonnement mensuel commence à la mise en ligne du site.</p>\n      <p>Le site reste la propriété de {{ $json.doc.studioName }} pendant la location. L'abonnement est sans engagement : il peut être arrêté à tout moment, le site est alors mis hors ligne. Un rachat du site est possible sur demande.</p>\n      <p>Pour accepter cette proposition, répondez simplement à l'email qui l'accompagne.</p>\n    </div>\n  </div>\n\n  <div class=\"footer\">\n    <span>{{ $json.doc.studioName }} — {{ $json.doc.studioCity }}</span>\n    <span>{{ $json.doc.studioEmail }}</span>\n    <span>{{ $json.doc.studioPhone }}</span>\n  </div>\n\n</body>\n</html>"
+      },
+      "type": "n8n-nodes-base.html",
+      "typeVersion": 1.2,
+      "position": [
+        2256,
+        -192
+      ],
+      "id": "52aa24a5-9dd1-479e-bc89-2df7e054770a",
+      "name": "Proposal HTML"
+    },
+    {
+      "parameters": {
+        "operation": "toText",
+        "sourceProperty": "html",
+        "options": {
+          "fileName": "index.html"
+        }
+      },
+      "type": "n8n-nodes-base.convertToFile",
+      "typeVersion": 1.2,
+      "position": [
+        2432,
+        -192
+      ],
+      "id": "7fde1e31-2603-4a86-b413-20b3061da11a",
+      "name": "HTML to file"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://gotenberg:3000/forms/chromium/convert/html",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Gotenberg-Output-Filename",
+              "value": "=proposition-{{ $('Price').item.json.proposalId }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "files",
+              "inputDataFieldName": "data"
+            },
+            {
+              "name": "preferCssPageSize",
+              "value": "true"
+            },
+            {
+              "name": "printBackground",
+              "value": "true"
+            },
+            {
+              "name": "waitDelay",
+              "value": "1s"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "pdf"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        2608,
+        -192
+      ],
+      "id": "9683bd22-9ac5-46fe-85b5-df1ba83f5e91",
+      "name": "Render PDF"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build log row — Proposal Engine, stage 5a\n// Shapes the proposal into exactly one row of the `proposals` table.\n// Why a Code node instead of mapping fields in the Supabase node: here every value keeps\n// its real type (numbers stay numbers, empty stays null, arrays stay arrays). Mapped\n// expressions can turn a missing value into \"\" and Postgres rejects \"\" for an integer column.\n// Mode: Run Once for All Items · Language: JavaScript\n\n// Reads from \"Price\" by name: the nodes after it (HTML, file, PDF) no longer carry this data.\nconst p = $('Price').first().json;\nconst { lead, requirements: req, pricing } = p;\n\nreturn [\n  {\n    json: {\n      proposal_id: p.proposalId,\n      is_test: lead.isTest === true,\n      status: pricing.manualQuote ? 'devis_manuel' : 'en_attente',\n\n      contact_name: lead.contact.name,\n      contact_email: lead.contact.email,\n      company: lead.contact.company,\n      sector: lead.sector,\n      goal: lead.goal,\n\n      project_type: req.projectType,\n      clarity: req.clarity,\n      needs_review: pricing.needsReview,\n      warnings: pricing.warnings,\n      red_flags: req.redFlags,\n\n      project_value: pricing.total,                         // null for manual quotes\n      setup_fee: pricing.rental ? pricing.rental.setupFee : null,\n      monthly_fee: pricing.rental ? pricing.rental.monthly : null,\n      budget_raw: lead.scope.budgetRaw,\n      budget_status: pricing.budget.status,\n      valid_until: p.validUntil,\n\n      payload: p,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2784,
+        -192
+      ],
+      "id": "cee760e6-290f-46b2-a905-1293d9f463a9",
+      "name": "Build log row"
+    },
+    {
+      "parameters": {
+        "tableId": "proposals",
+        "dataToSend": "autoMapInputData"
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        2960,
+        -192
+      ],
+      "id": "b6f5dcb4-5242-4179-bfec-b4eb82da75f6",
+      "name": "Create a row"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Approval email — Proposal Engine, stage 5b\n// Writes the email YOU receive before anything reaches the prospect:\n// a subject that tells you at a glance whether to look closely, and a body with\n// the offer, the budget check and every warning, so you decide in 30 seconds.\n// It also brings the PDF back: the nodes after \"Render PDF\" (log row, Supabase) dropped it.\n// Mode: Run Once for All Items · Language: JavaScript\n\nconst p = $('Price').first().json;\nconst { lead, requirements: req, pricing } = p;\n\n// French number with a regular no-break space as thousands separator.\nconst fr = (n) => n.toLocaleString('fr-FR').replace(/\\u202f/g, '\\u00a0');\n\nconst BUDGET_STATUS = {\n  dans_budget: 'dans le budget',\n  au_dessus: 'AU-DESSUS du budget',\n  en_dessous: 'en dessous du budget',\n  inconnu: 'budget non comparable',\n};\n\n// ---------------------------------------------------------------------------\n// Subject: test flag, review flag, ID, company, offer\n// ---------------------------------------------------------------------------\nconst tags = [];\nif (lead.isTest) tags.push('[TEST]');\ntags.push(pricing.manualQuote ? '[DEVIS MANUEL]' : pricing.needsReview ? '[À VÉRIFIER]' : '[OK]');\n\nconst offerShort = pricing.rental\n  ? `${fr(pricing.rental.monthly)} DH/mois`\n  : 'sur devis';\n\nconst subject = `${tags.join(' ')} ${p.proposalId} · ${lead.contact.company || 'Sans entreprise'} · ${offerShort}`;\n\n// ---------------------------------------------------------------------------\n// Body\n// ---------------------------------------------------------------------------\nconst bullets = (items) => (items && items.length ? items.map((i) => `- ${i}`).join('\\n') : '- aucun');\n\nconst lines = [\n  `Proposition ${p.proposalId}`,\n  '',\n  `Prospect : ${lead.contact.name} <${lead.contact.email}>`,\n  `Entreprise : ${lead.contact.company}`,\n  `Secteur : ${lead.sector} · Type détecté : ${req.projectType}`,\n  `Objectif : « ${lead.goal} »`,\n  `Clarté de la demande : ${req.clarity}`,\n  '',\n];\n\nif (pricing.rental) {\n  lines.push(\n    `Offre : ${fr(pricing.rental.setupFee)} DH de mise en place + ${fr(pricing.rental.monthly)} DH/mois, sans engagement`,\n    `Valeur du projet : ${fr(pricing.total)} DH (rentabilisé au mois ${pricing.rental.breakEvenMonth})`,\n  );\n} else {\n  lines.push('Offre : DEVIS MANUEL, aucun prix automatique.');\n}\n\nlines.push(\n  `Budget indiqué : ${lead.scope.budgetRaw ?? 'non renseigné'} → ${BUDGET_STATUS[pricing.budget.status] || pricing.budget.status}`,\n  `Lancement souhaité : ${lead.scope.deadline ?? 'non précisé'}${pricing.weeksToDeadline !== null ? ` (dans ${pricing.weeksToDeadline} semaines)` : ''}`,\n  '',\n  'Détail du prix :',\n  bullets(pricing.lines.map((l) => `${l.label} : ${l.amountLabel}`)),\n  '',\n  'Avertissements :',\n  bullets(pricing.warnings),\n  '',\n  \"Points d'attention (IA) :\",\n  bullets(req.redFlags),\n  '',\n  'Questions à poser au prospect :',\n  bullets(req.questionsToAsk),\n);\n\nif (lead.scope.notes) {\n  lines.push('', `Remarques du prospect : ${lead.scope.notes}`);\n}\n\nreturn [\n  {\n    json: {\n      proposalId: p.proposalId,\n      manualQuote: pricing.manualQuote,\n      subject,\n      body: lines.join('\\n'),\n    },\n    // The PDF from \"Render PDF\", so it can be attached again.\n    binary: $('Render PDF').first().binary,\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3136,
+        -192
+      ],
+      "id": "b04d7d6f-df00-4cac-b717-a7ea64557a0c",
+      "name": "Approval email"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 4
+          },
+          "conditions": [
+            {
+              "id": "22ec6d5e-95df-48a8-8bef-0c5e2c27fbb3",
+              "leftValue": "={{ $json.manualQuote }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.4,
+      "position": [
+        3312,
+        -192
+      ],
+      "id": "3428dce7-3d40-4b1b-b0d3-7175b9c2f9e1",
+      "name": "Manual quote?"
+    },
+    {
+      "parameters": {
+        "operation": "sendAndWait",
+        "sendTo": "YOUR_EMAIL@example.com",
+        "subject": "={{ $json.subject }}",
+        "message": "={{ $json.body }}",
+        "approvalOptions": {
+          "values": {
+            "approvalType": "double",
+            "approveLabel": "Envoyer au prospect",
+            "disapproveLabel": "Ne pas envoyer"
+          }
+        },
+        "options": {
+          "limitWaitTime": {
+            "values": {
+              "resumeAmount": 3,
+              "resumeUnit": "days"
+            }
+          },
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        3536,
+        -96
+      ],
+      "id": "636184b8-43cc-4985-817a-a41d35b7caa2",
+      "name": "Ask approval"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 4
+          },
+          "conditions": [
+            {
+              "id": "f96403ae-6302-4bff-82c7-77c1742b7ebb",
+              "leftValue": "={{ $json.data.approved }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.4,
+      "position": [
+        3696,
+        -96
+      ],
+      "id": "f361e068-eeb5-4235-8686-3ba639c5ca41",
+      "name": "Approved?"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "proposals",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "proposal_id",
+              "condition": "eq",
+              "keyValue": "={{ $('Price').item.json.proposalId }}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "status",
+              "fieldValue": "refusee"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        3920,
+        0
+      ],
+      "id": "88405b2d-1882-4dbd-b951-5888e5760b91",
+      "name": "Mark declined"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "proposals",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "proposal_id",
+              "condition": "eq",
+              "keyValue": "={{ $('Price').item.json.proposalId }}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "status",
+              "fieldValue": "envoyee"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        4240,
+        -192
+      ],
+      "id": "50c2453a-4697-42f5-aaa3-f1c2d93bd401",
+      "name": "Mark sent"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "proposal-intake",
+        "authentication": "headerAuth",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.2,
+      "position": [
+        352,
+        0
+      ],
+      "id": "a00b1c7d-c677-4c3a-aa46-7b50eeef3814",
+      "name": "Webhook"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 4
+          },
+          "conditions": [
+            {
+              "id": "08ca18d0-a59e-46cb-abac-6030ea870820",
+              "leftValue": "",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.4,
+      "position": [
+        688,
+        0
+      ],
+      "id": "27ed13a1-2f24-42e8-98b5-c834588d890b",
+      "name": "Valid?"
+    },
+    {
+      "parameters": {
+        "errorMessage": "=   Soumission invalide : {{ $json.errors.join(', ') }}"
+      },
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        912,
+        112
+      ],
+      "id": "306cf018-b1b2-4699-ac4a-41becea25659",
+      "name": "Stop and Error"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prospect email — Proposal Engine, stage 5c\n// Writes the email the prospect receives with their PDF, after you clicked \"Envoyer\".\n// Safety: on a TEST run the email goes to YOU, never to the address typed in the form.\n// Mode: Run Once for All Items · Language: JavaScript\n\n// ---------------------------------------------------------------------------\n// CONFIG\n// ---------------------------------------------------------------------------\nconst OWNER_EMAIL = 'YOUR_EMAIL@example.com';        // test runs are sent here instead of to the prospect\nconst SIGNATURE = [\n  'CasaWebBuild',\n  'Sites web sur mesure — Casablanca',\n  'YOUR_PHONE',\n].join('\\n');\nconst MAX_QUESTIONS = 2;                  // questions from the AI included in the email\n\n// ---------------------------------------------------------------------------\n// Helpers\n// ---------------------------------------------------------------------------\nconst p = $('Price').first().json;\nconst { lead, requirements: req, pricing } = p;\nconst fr = (n) => n.toLocaleString('fr-FR').replace(/\\u202f/g, '\\u00a0');\nconst capitalize = (s) => s.replace(/(^|\\s|-)(\\p{L})/gu, (m, sep, ch) => sep + ch.toUpperCase());\n\nconst firstName = capitalize((lead.contact.name || '').trim().split(/\\s+/)[0] || '');\nconst company = capitalize(lead.contact.company || 'votre entreprise');\nconst isTest = lead.isTest === true;\n\n// ---------------------------------------------------------------------------\n// Email\n// ---------------------------------------------------------------------------\nconst subject = `${isTest ? '[TEST] ' : ''}Votre proposition CasaWebBuild — ${company}`;\n\nconst lines = [\n  firstName ? `Bonjour ${firstName},` : 'Bonjour,',\n  '',\n  `Merci pour votre demande. Vous trouverez en pièce jointe la proposition préparée pour ${company}.`,\n  '',\n  `En résumé : ${fr(pricing.rental.setupFee)} DH de mise en place, puis ${fr(pricing.rental.monthly)} DH par mois, sans engagement. La maintenance et les petites mises à jour sont comprises.`,\n];\n\nconst questions = (req.questionsToAsk || []).slice(0, MAX_QUESTIONS);\nif (questions.length) {\n  lines.push(\n    '',\n    'Pour affiner le projet, deux points m\\'aideraient :',\n    ...questions.map((q) => `- ${q}`),\n  );\n}\n\nlines.push(\n  '',\n  `Pour accepter, répondez simplement à cet email : je vous recontacte pour lancer le projet. La proposition est valable jusqu'au ${p.validUntilLabel}.`,\n  '',\n  'À très vite,',\n  SIGNATURE,\n);\n\nreturn [\n  {\n    json: {\n      proposalId: p.proposalId,\n      to: isTest ? OWNER_EMAIL : lead.contact.email,\n      subject,\n      body: lines.join('\\n'),\n    },\n    // The PDF again: \"Ask approval\" outputs only your answer, not the file.\n    binary: $('Render PDF').first().binary,\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3920,
+        -192
+      ],
+      "id": "18b9371b-de92-459c-ae8d-ffca56e38d75",
+      "name": "Prospect email"
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.to }}",
+        "subject": "={{ $json.subject }}",
+        "message": "={{ $json.body }}",
+        "options": {
+          "appendAttribution": false,
+          "attachmentsUi": {
+            "attachmentsBinary": [
+              {
+                "property": "pdf"
+              }
+            ]
+          },
+          "senderName": "CasaWebBuild"
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        4080,
+        -192
+      ],
+      "id": "fbb04857-11e8-4db0-9aab-93b5c50a6361",
+      "name": "Send proposal"
+    },
+    {
+      "parameters": {
+        "sendTo": "YOUR_EMAIL@example.com",
+        "subject": "={{ $json.subject }}",
+        "emailType": "text",
+        "message": "={{ $json.body }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        3536,
+        -288
+      ],
+      "id": "7adf7fb4-9ad5-44e3-8b14-dff531580b74",
+      "name": "Manual quote alert"
+    },
+    {
+      "parameters": {
+        "content": "## Proposal Engine\n",
+        "height": 560,
+        "width": 4144,
+        "color": 5
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        304,
+        -304
+      ],
+      "id": "e44eb94b-62d0-4873-91d9-2ab465e71cef",
+      "name": "Sticky Note"
+    }
+  ],
+  "connections": {
+    "Normalize": {
+      "main": [
+        [
+          {
+            "node": "Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Extract requirements",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract requirements": {
+      "main": [
+        [
+          {
+            "node": "Validity date",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validity date": {
+      "main": [
+        [
+          {
+            "node": "Format validity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format validity": {
+      "main": [
+        [
+          {
+            "node": "Proposal hash",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Proposal hash": {
+      "main": [
+        [
+          {
+            "node": "Assemble proposal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble proposal": {
+      "main": [
+        [
+          {
+            "node": "Price",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Price": {
+      "main": [
+        [
+          {
+            "node": "Prepare Document",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Document": {
+      "main": [
+        [
+          {
+            "node": "Proposal HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Proposal HTML": {
+      "main": [
+        [
+          {
+            "node": "HTML to file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTML to file": {
+      "main": [
+        [
+          {
+            "node": "Render PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Render PDF": {
+      "main": [
+        [
+          {
+            "node": "Build log row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build log row": {
+      "main": [
+        [
+          {
+            "node": "Create a row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create a row": {
+      "main": [
+        [
+          {
+            "node": "Approval email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approval email": {
+      "main": [
+        [
+          {
+            "node": "Manual quote?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual quote?": {
+      "main": [
+        [
+          {
+            "node": "Manual quote alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ask approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ask approval": {
+      "main": [
+        [
+          {
+            "node": "Approved?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approved?": {
+      "main": [
+        [
+          {
+            "node": "Prospect email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark declined",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid?": {
+      "main": [
+        [
+          {
+            "node": "Extract requirements",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Stop and Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prospect email": {
+      "main": [
+        [
+          {
+            "node": "Send proposal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send proposal": {
+      "main": [
+        [
+          {
+            "node": "Mark sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "nodeGroups": [],
+  "pinData": {}
+}
